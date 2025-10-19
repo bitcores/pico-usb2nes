@@ -1,0 +1,52 @@
+.program nesoe
+; monitor joypad 1/2 OE to strobe output
+; send wait interrupt
+    jmp pin setoe
+oeloop:
+    nop [5]
+    wait 1 pin 0
+setoe:
+    irq wait 3
+    nop [5]
+    wait 0 pin 0
+    jmp oeloop
+
+
+.program nesinrst
+; monitor OUT0 for row reset
+    jmp pin setrst
+rstloop:
+    irq clear 0
+    nop [5]
+    wait 1 pin 0
+setrst:
+    irq set 0
+    nop [5]
+    wait 0 pin 0
+    jmp rstloop
+    
+.program nesinadv
+; monitor OUT1 for row advance
+    jmp pin setadv
+advloop:
+    irq clear 1
+    nop [5]
+    wait 1 pin 0
+setadv:
+    irq set 1
+    nop [5]
+    wait 0 pin 0
+    jmp advloop
+    
+.program nesinen
+; monitor OUT2 for enable
+    jmp pin seten
+enloop:
+    irq clear 2
+    nop [5]
+    wait 1 pin 0
+seten:
+    irq set 2
+    nop [5]
+    wait 0 pin 0
+    jmp enloop
