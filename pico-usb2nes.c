@@ -110,6 +110,7 @@ static uint8_t transbbindex = 0;
 static int16_t msebuffer[4];
 // we want to store 
 static int16_t mseinstbuf[4];
+static uint8_t joypadinst = 0;
 
 static bool NESinlatch = false;
 
@@ -120,6 +121,11 @@ static bool instrobe = false;
 
 static uint32_t kbword = 0;
 static uint32_t mseword = 0;
+static uint32_t nesjoypad = 0;
+
+// gonna use arrow keys for dpad
+// x for A, z for B, w for start, q for select
+static const uint8_t neskeys[] = { 0x1B, 0x1D, 0x14, 0x1A, 0x52, 0x51, 0x50, 0x4F };
 
 
 // https://github.com/raspberrypi/pico-examples/blob/master/blink/blink.c
@@ -155,8 +161,12 @@ void pico_set_led(bool led_on) {
     // Ask the wifi "driver" to set the GPIO on or off
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
 #elif defined(PICO_DEFAULT_WS2812_PIN)
-    // for RP2040-zerp devices
-    pio_sm_put_blocking(pio0, 1, 0x22222222); // dullwhite
+    // for RP2040-zero devices
+    if (led_on) {
+        pio_sm_put_blocking(pio0, 1, 0x22222222); // dullwhite
+    } else {
+        pio_sm_put_blocking(pio0, 1, 0); // off
+    }
 #endif
 }
 // -----------------------------------------------------------
@@ -272,6 +282,7 @@ void pio_IRQ_handler() {
     if (pio_interrupt_get(pio0, 3)) {
         mseword = mseword << 1;
         kbword = kbword << 1;
+        nesjoypad = nesjoypad >> 1;
 
         pio_interrupt_clear(pio0, 3);
     }
@@ -305,6 +316,7 @@ void nes_handler_thread() {
 
             kbword = 0x00000000;
             mseword = 0x00000000;
+            nesjoypad = joypadinst;
             // load the four oldest buffered values
             for (int i = 0; i < WORD_SIZE; i++) {
                 kbword = kbword << 8;
@@ -328,11 +340,13 @@ void nes_handler_thread() {
             NESinlatch = false;
         }
 
-        uint32_t serialout = 3;
+        uint32_t serialout = 2; // effectively D1 on the pico, doesn't go to nes
         // push next mouse bit in
         serialout += (~mseword & 0x80000000) >> 27;
         // push the next keyboard bit in
         serialout += (~kbword & 0x80000000) >> 28;
+        // push the joypad bit, this could be connected to D0 or D1 on the port
+        serialout += (~nesjoypad & 0x01);
     
         usb2famikb_putkb(serialout);
     }
@@ -373,6 +387,7 @@ int main() {
     // strobes for update before data received it will know
     // the interface is present
     msebuffer[0] = mseinstbuf[0] = 0x06;
+    joypadinst = 0x00;
 
     multicore_reset_core1();
     //  run the NES handler on seperate core
@@ -502,6 +517,14 @@ static inline void find_releases_in_report(hid_keyboard_report_t const *prev_rep
         if (prev_report->keycode[i] == 0x00) { break; }
         if (prev_report->keycode[i] != report->keycode[i]) {
             keycode_handler(prev_report->keycode[i] + 0x80);
+            for (uint8_t j = 0; j < 8; ++j) {
+                if (prev_report->keycode[i] == neskeys[j]) {
+                    if (joypadinst & (1 << j)) {
+                        joypadinst ^= 1 << j;
+                    }
+                    break;
+                }
+            }
             break;
         }
     }
@@ -543,6 +566,12 @@ static void process_kbd_report(hid_keyboard_report_t const *report)
                 // ignore for now would like a repeat thing
             } else {
                 keycode_handler(keycode);
+                for (uint8_t j = 0; j < 8; ++j) {
+                    if (keycode == neskeys[j]) {
+                        joypadinst |= 1 << j;
+                        break;
+                    }
+                }
             }
         }
     }
