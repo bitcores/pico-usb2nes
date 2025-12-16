@@ -124,8 +124,10 @@ static uint32_t mseword = 0;
 static uint32_t nesjoypad = 0;
 
 // gonna use arrow keys for dpad
-// x for A, z for B, w for start, q for select
-static const uint8_t neskeys[] = { 0x1B, 0x1D, 0x14, 0x1A, 0x52, 0x51, 0x50, 0x4F };
+// x for A, z for B, q for select, w for start
+// if you are changing these keys, the order is important!
+static const uint8_t neskeys[] = { KEY_X, KEY_Z, KEY_Q, KEY_W, 
+                        KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT };
 
 
 // https://github.com/raspberrypi/pico-examples/blob/master/blink/blink.c
