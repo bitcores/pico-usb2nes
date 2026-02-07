@@ -64,7 +64,6 @@
 #define HORILOWSPD 0
 #define SENDREPEATS 1
 
-
 // configuration for PIO USB
 // DPDM configuration D+ = pin 6, D- = pin 7
 // configure used SMs around currently used SMs
@@ -78,6 +77,14 @@
             NULL, PIO_USB_DEBUG_PIN_NONE,                                       \
             PIO_USB_DEBUG_PIN_NONE, false, PIO_USB_PINOUT_DPDM                  \
     }
+
+#define MAX_REPORT 4
+// Each HID instance can has multiple reports
+static struct
+{
+  uint8_t report_count;
+  tuh_hid_report_info_t report_info[MAX_REPORT];
+}hid_info[CFG_TUH_HID];
 
 static const uint8_t modkeys[] = { 
     KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_LEFTMETA,
@@ -488,11 +495,12 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
                 break;
         }
         new_input_msg = true;
-
-        //  set up report receiving
-        tuh_hid_receive_report(dev_addr, instance);
-
+    } else {
+        // for when device is not a boot type (gamepads for example)
+        hid_info[instance].report_count = tuh_hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
     }
+    //  set up report receiving
+    tuh_hid_receive_report(dev_addr, instance);
 }
 
 // Invoked when device with hid interface is un-mounted
@@ -506,6 +514,8 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
             break;
         case (HID_ITF_PROTOCOL_MOUSE):
             mseinstbuf[0] &= 0xDF;
+            break;
+        default:
             break;
     }
     new_input_msg = true;
@@ -627,25 +637,127 @@ static void process_mouse_report(hid_mouse_report_t const *report)
 
 }
 
+// process the gamepad report
+// gamepads are complicated, what is done here will depend on how long
+// the report is. for now, 3 byte report: dpad x, dpad y, buttons
+static void process_gamepad_report(uint8_t const* report, uint16_t len)
+{
+    uint8_t newjoypad = 0x00;
+    if (len == 3) {
+        // left overrides up
+        if (report[0] == 0x00) {
+            newjoypad |= 64;
+        }
+        else if (report[0] == 0xFF) {
+            newjoypad |= 128;
+        }
+        // up overrides down
+        if (report[1] == 0x00) {
+            newjoypad |= 16;
+        }
+        else if (report[1] == 0xFF) {
+            newjoypad |= 32;
+        }
+        // other buttons 
+        if ((report[2] & 0x80) == 0x80) {
+            newjoypad |= 8;
+        }
+        if ((report[2] & 0x40) == 0x40) {
+            newjoypad |= 4;
+        }
+        if ((report[2] & 0x04) == 0x04) {
+            newjoypad |= 2;
+        }
+        if ((report[2] & 0x08) == 0x08) {
+            newjoypad |= 1;
+        }
+
+        joypadinst = newjoypad;
+    }
+    
+}
+
+//--------------------------------------------------------------------+
+// Generic Report
+//--------------------------------------------------------------------+
+// handle non-boot reports, especially for gamepads
+static void process_generic_report(uint8_t instance, uint8_t const* report, uint16_t len)
+{
+    (void) len;
+
+    uint8_t const rpt_count = hid_info[instance].report_count;
+    tuh_hid_report_info_t* rpt_info_arr = hid_info[instance].report_info;
+    tuh_hid_report_info_t* rpt_info = NULL;
+
+    if ( rpt_count == 1 && rpt_info_arr[0].report_id == 0) {
+        // Simple report without report ID as 1st byte
+        rpt_info = &rpt_info_arr[0];
+    }
+    else {
+        // Composite report, 1st byte is report ID, data starts from 2nd byte
+        uint8_t const rpt_id = report[0];
+        // Find report id in the array
+        for(uint8_t i=0; i<rpt_count; i++) {
+            if (rpt_id == rpt_info_arr[i].report_id ) {
+                rpt_info = &rpt_info_arr[i];
+                break;
+            }
+        }
+        report++;
+        len--;
+    }
+
+    if (!rpt_info){
+        return;
+    }
+
+
+    if ( rpt_info->usage_page == HID_USAGE_PAGE_DESKTOP )
+    {
+        switch (rpt_info->usage)
+        {
+            case HID_USAGE_DESKTOP_KEYBOARD:
+            // Assume keyboard follow boot report layout
+            process_kbd_report((hid_keyboard_report_t const*) report );
+            break;
+
+            case HID_USAGE_DESKTOP_MOUSE:
+            // Assume mouse follow boot report layout
+            process_mouse_report((hid_mouse_report_t const*) report );
+            break;
+
+            case HID_USAGE_DESKTOP_GAMEPAD:
+            process_gamepad_report(report, len);
+            break;
+
+            default: break;
+        }
+    }
+}
+
 // Invoked when received report from device via interrupt endpoint
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len)
 {
     (void) len;
-    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+    if (len > 0) {
+        uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
 
-    switch(itf_protocol)
-    {
-        case HID_ITF_PROTOCOL_KEYBOARD:
-        process_kbd_report((hid_keyboard_report_t const*) report );
-        break;
+        switch(itf_protocol)
+        {
+            case HID_ITF_PROTOCOL_KEYBOARD:
+            process_kbd_report((hid_keyboard_report_t const*) report );
+            break;
 
-        case HID_ITF_PROTOCOL_MOUSE:
-        process_mouse_report((hid_mouse_report_t const*) report );
-        break;
+            case HID_ITF_PROTOCOL_MOUSE:
+            process_mouse_report((hid_mouse_report_t const*) report );
+            break;
 
-        default: break;
+            default: 
+            // gamepads in particular require different identification
+            process_generic_report(instance, report, len);
+            break;
+        }
     }
-
     // continue to request to receive report
     tuh_hid_receive_report(dev_addr, instance);
 }

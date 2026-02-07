@@ -6,9 +6,13 @@
 #pragma once
 
 #include "hardware/pio.h"
+#include "hardware/regs/sysinfo.h"
 #include "pio_usb_configuration.h"
 #include "usb_definitions.h"
 #include <stdint.h>
+
+#include "usb_tx.pio.h"
+#include "usb_rx.pio.h"
 
 enum {
   PIO_USB_INTS_CONNECT_POS = 0,
@@ -80,6 +84,7 @@ typedef struct {
   pio_clk_div_t clk_div_ls_rx;
 
   bool need_pre;
+  bool low_speed;
 
   uint8_t usb_rx_buffer[128];
 } pio_port_t;
@@ -112,6 +117,7 @@ extern pio_port_t pio_port[1];
 #define IRQ_TX_EOP_MASK (1 << IRQ_TX_EOP)
 #define IRQ_TX_ALL_MASK (IRQ_TX_EOP_MASK)
 #define IRQ_RX_COMP_MASK (1 << IRQ_RX_EOP)
+#define IRQ_RX_START_MASK (1 << IRQ_RX_START)
 #define IRQ_RX_ALL_MASK                                             \
   ((1 << IRQ_RX_EOP) | (1 << IRQ_RX_BS_ERR) | (1 << IRQ_RX_START) | \
    (1 << DECODER_TRIGGER))
@@ -124,23 +130,46 @@ extern pio_port_t pio_port[1];
 void pio_usb_bus_init(pio_port_t *pp, const pio_usb_configuration_t *c,
                       root_port_t *root);
 
-void pio_usb_bus_start_receive(const pio_port_t *pp);
 void pio_usb_bus_prepare_receive(const pio_port_t *pp);
 int pio_usb_bus_receive_packet_and_handshake(pio_port_t *pp, uint8_t handshake);
-void pio_usb_bus_usb_transfer(const pio_port_t *pp, uint8_t *data,
+void pio_usb_bus_usb_transfer(pio_port_t *pp, uint8_t *data,
                               uint16_t len);
 
 uint8_t pio_usb_bus_wait_handshake(pio_port_t *pp);
-void pio_usb_bus_send_handshake(const pio_port_t *pp, uint8_t pid);
-void pio_usb_bus_send_token(const pio_port_t *pp, uint8_t token, uint8_t addr,
+void pio_usb_bus_send_token(pio_port_t *pp, uint8_t token, uint8_t addr,
                             uint8_t ep_num);
 
 static __always_inline port_pin_status_t
 pio_usb_bus_get_line_state(root_port_t *root) {
+#ifdef PICO_RP2350
+  // RP2350-E9 Errata affect up to rev A2/B0
+  // workaround: disable input enable (to drain leaked current), then enable it immediately before reading
+  // Avoid rp2350_chip_version()/gpio_set_input_enabled() to make sure this is in SRAM
+  uint32_t const chip_id = *((io_ro_32*)(SYSINFO_BASE + SYSINFO_CHIP_ID_OFFSET));
+  uint32_t const chip_version = (chip_id & SYSINFO_CHIP_ID_REVISION_BITS) >> SYSINFO_CHIP_ID_REVISION_LSB;
+  if (chip_version <= 2) {
+    hw_clear_bits(&pads_bank0_hw->io[root->pin_dp], PADS_BANK0_GPIO0_IE_BITS);
+    hw_clear_bits(&pads_bank0_hw->io[root->pin_dm], PADS_BANK0_GPIO0_IE_BITS);
+
+    // short delay to drain leaked current, required when overclocked CPU, tested with 264Mhz
+    __asm volatile("nop; nop; nop; nop; nop; nop; nop; nop;");
+
+    hw_set_bits(&pads_bank0_hw->io[root->pin_dp], PADS_BANK0_GPIO0_IE_BITS);
+    hw_set_bits(&pads_bank0_hw->io[root->pin_dm], PADS_BANK0_GPIO0_IE_BITS);
+  }
+#endif
+
   uint8_t dp = gpio_get(root->pin_dp) ? 0 : 1;
   uint8_t dm = gpio_get(root->pin_dm) ? 0 : 1;
 
   return (dm << 1) | dp;
+}
+
+static __always_inline void pio_usb_bus_start_receive(const pio_port_t *pp) {
+  pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
+  while ((pp->pio_usb_rx->irq & IRQ_RX_ALL_MASK) != 0) {
+    continue;
+  }
 }
 
 //--------------------------------------------------------------------+
@@ -183,6 +212,8 @@ void pio_usb_host_close_device(uint8_t root_idx, uint8_t device_address);
 
 bool pio_usb_host_endpoint_open(uint8_t root_idx, uint8_t device_address,
                                 uint8_t const *desc_endpoint, bool need_pre);
+bool pio_usb_host_endpoint_close(uint8_t root_idx, uint8_t device_address,
+                                 uint8_t ep_address);
 bool pio_usb_host_send_setup(uint8_t root_idx, uint8_t device_address,
                              uint8_t const setup_packet[8]);
 bool pio_usb_host_endpoint_transfer(uint8_t root_idx, uint8_t device_address,

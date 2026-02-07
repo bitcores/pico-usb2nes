@@ -200,10 +200,10 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
     endpoint_t *ep = PIO_USB_ENDPOINT(ep_num << 1);
 
   gpio_clr_mask(1<<4);
-    uint8_t hanshake = ep->stalled
+    uint8_t handshake = ep->stalled
                            ? USB_PID_STALL
                            : (ep->has_transfer ? USB_PID_ACK : USB_PID_NAK);
-    int res = pio_usb_bus_receive_packet_and_handshake(pp, hanshake);
+    int res = pio_usb_bus_receive_packet_and_handshake(pp, handshake);
     pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
     restart_usb_receiver(pp);
     pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
@@ -291,7 +291,7 @@ usb_device_t *pio_usb_device_init(const pio_usb_configuration_t *c,
   // configure PIOx_IRQ_0 to detect packet receive start
   pio_set_irqn_source_enabled(pp->pio_usb_rx, 0, pis_interrupt0 + IRQ_RX_START,
                               true);
-  pp->device_rx_irq_num = (pp->pio_usb_rx == pio0) ? PIO0_IRQ_0 : PIO1_IRQ_0;
+  pp->device_rx_irq_num = PIO_IRQ_NUM(pp->pio_usb_rx, 0);
   irq_set_exclusive_handler(pp->device_rx_irq_num, usb_device_packet_handler);
   irq_set_enabled(pp->device_rx_irq_num, true);
 
