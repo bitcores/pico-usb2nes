@@ -95,6 +95,7 @@ static const uint8_t modkeys[] = {
 static struct
 {
     uint8_t mem[6];
+    uint8_t mem_p;
     uint8_t mem_address;
     bool mem_address_written;
     bool garbage_message;
@@ -205,18 +206,14 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
             hostmsg.mem_address = i2c_read_byte_raw(i2c);
             // the first value here is a len, ignore
             // address should be 0x00 for inputs, 0x10 for set mode
-            hostmsg.garbage_message = true;
-            hostmsg.skiplen = false;
-            if (hostmsg.mem_address == 0x00 || hostmsg.mem_address == 0x10) {
-                hostmsg.garbage_message = false;
-            }
-            if (hostmsg.mem_address == 0x00) {
-                hostmsg.skiplen = true;
-            }
+            hostmsg.garbage_message = !(hostmsg.mem_address == 0x00 || hostmsg.mem_address == 0x10);
+            hostmsg.skiplen = (hostmsg.mem_address == 0x00);
             hostmsg.mem_address_written = true;
+            hostmsg.mem_p = 0;
         } else {
             // if it is garbage we just read the values
             // but don't put them in memory
+            // also the message len byte is skipped
             if (hostmsg.garbage_message || hostmsg.skiplen) {
                 i2c_read_byte_raw(i2c);
                 hostmsg.skiplen = false;
@@ -225,8 +222,8 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
                 // put the values into buffer
                 if (hostmsg.mem_address == 0x00) {
                     if (i2cmode == 0x00) {
-                        hostmsg.mem[hostmsg.mem_address] = i2c_read_byte_raw(i2c);
-                        hostmsg.mem_address = (hostmsg.mem_address + 1) % 6;
+                        hostmsg.mem[hostmsg.mem_p] = i2c_read_byte_raw(i2c);
+                        hostmsg.mem_p = (hostmsg.mem_p + 1) % 6;
                     } else if (i2cmode == 0x10) {
                         inpbuff_i = (inpbuff_i + 1) % 256;
                         inpbuff[inpbuff_i] = i2c_read_byte_raw(i2c);
@@ -245,28 +242,28 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
         break;
     case I2C_SLAVE_FINISH: // master has signalled Stop / Restart
         if (!hostmsg.garbage_message) {
-            if (hostmsg.mem_address == 0x00) {
+            if (i2cmode == 0x00) {
                 // parse the value from mem[1] if not 0x00
-                if (hostmsg.mem[1] != 0x00) {
-                    keycode_handler(hostmsg.mem[1]);
+                if (hostmsg.mem[0] != 0x00) {
+                    keycode_handler(hostmsg.mem[0]);
                 }
                 // only update mouse buffer if mouse is "present"
-                if ((hostmsg.mem[2] & 32) == 32) {
+                if ((hostmsg.mem[1] & 32) == 32) {
                     // and the first byte with the current value
                     // this means if a button is pressed, it will stay "pressed"
                     // until the NES polls it (probably next frame)
-                    msebuffer[0] |= hostmsg.mem[2];
+                    msebuffer[0] |= hostmsg.mem[1];
                     // if true, we are in relative mode
                     if ((msebuffer[0] & 8) == 8 && new_input_msg) {
-                        msebuffer[1] += (int8_t)hostmsg.mem[3];
-                        msebuffer[2] += (int8_t)hostmsg.mem[4];
+                        msebuffer[1] += (int8_t)hostmsg.mem[2];
+                        msebuffer[2] += (int8_t)hostmsg.mem[3];
                     } else {
-                        msebuffer[1] = (int8_t)hostmsg.mem[3];
-                        msebuffer[2] = (int8_t)hostmsg.mem[4];   
+                        msebuffer[1] = (int8_t)hostmsg.mem[2];
+                        msebuffer[2] = (int8_t)hostmsg.mem[3];   
                     }
                     // some wheel movements or middle button events could
                     // be missed. target for improvement later
-                    msebuffer[3] |= hostmsg.mem[5];
+                    msebuffer[3] |= hostmsg.mem[4];
                 }
                 new_input_msg = true;
             }
@@ -286,8 +283,8 @@ static void update_mouse_data() {
     if (new_input_msg) {
         if (i2chostenable) {
             // actually update button values
-            msebuffer[0] = hostmsg.mem[2];
-            msebuffer[3] = hostmsg.mem[5];
+            msebuffer[0] = hostmsg.mem[1];
+            msebuffer[3] = hostmsg.mem[4];
         } else {
             msebuffer[0] = mseinstbuf[0];
             msebuffer[1] = mseinstbuf[1];
