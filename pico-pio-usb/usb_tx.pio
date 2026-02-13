@@ -3,15 +3,15 @@
 .define public IRQ_TX_EOP 0   ; EOP start flag bit
 
 ; USB NRZI transmitter
-; Run at 48 MHz for full-spped (x4)
-; Run at 6 MHz for low-spped (x4)
+; Run at 48 MHz for full-speed (x4)
+; Run at 6 MHz for low-speed (x4)
 ; autopull enabled
 ; Should be placed at address 0
 .program usb_tx_dpdm
 .side_set 2
 
 ; J for fs, K for ls
-.define FJ_LK 0b01
+.define public FJ_LK 0b01
 ; K for fs, J for ls
 .define FK_LJ 0b10
 .define SE0 0b00
@@ -49,14 +49,14 @@ set pindirs, 0b11   side FJ_LK
 .wrap
 
 ; USB NRZI transmitter
-; Run at 48 MHz for full-spped
-; Run at 6 MHz for low-spped
+; Run at 48 MHz for full-speed
+; Run at 6 MHz for low-speed
 ; autopull enabled
 .program usb_tx_dmdp
 .side_set 2
 
 .define FK_LJ 0b01
-.define FJ_LK 0b10
+.define public FJ_LK 0b10
 .define SE0 0b00
 
 irq IRQ_TX_EOP      side SE0 [7]
@@ -91,6 +91,7 @@ set pindirs, 0b11   side FJ_LK
 
 % c-sdk {
 #include "hardware/clocks.h"
+#include "sdk_compat.h"
 
   static void __no_inline_not_in_flash_func(usb_tx_configure_pins)(PIO pio, uint sm, uint pin_dp, uint pin_dm) {
     if (pin_dp < pin_dm) {
@@ -106,7 +107,7 @@ set pindirs, 0b11   side FJ_LK
 
   static inline void usb_tx_fs_program_init(PIO pio, uint sm, uint offset,
                                          uint pin_dp, uint pin_dm) {
-    pio_sm_set_pins_with_mask(pio, sm, (1 << pin_dp), ((1 << pin_dp) | (1 << pin_dm)));
+    pio_sm_set_pins_with_mask64(pio, sm, (1ull << pin_dp), ((1ull << pin_dp) | (1ull << pin_dm)));
 
     gpio_pull_down(pin_dp);
     gpio_pull_down(pin_dm);
@@ -132,7 +133,7 @@ set pindirs, 0b11   side FJ_LK
 
   static inline void usb_tx_ls_program_init(PIO pio, uint sm, uint offset,
                                          uint pin_dp, uint pin_dm) {
-    pio_sm_set_pins_with_mask(pio, sm, (1 << pin_dm), ((1 << pin_dp) | (1 << pin_dm)));
+    pio_sm_set_pins_with_mask64(pio, sm, (1ull << pin_dm), ((1ull << pin_dp) | (1ull << pin_dm)));
 
     gpio_pull_down(pin_dp);
     gpio_pull_down(pin_dm);

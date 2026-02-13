@@ -23,8 +23,6 @@
 #include "pio_usb_configuration.h"
 #include "pio_usb_ll.h"
 #include "usb_crc.h"
-#include "usb_tx.pio.h"
-#include "usb_rx.pio.h"
 
 #define UNUSED_PARAMETER(x) (void)x
 
@@ -42,24 +40,33 @@ static uint8_t pre_encoded[5];
 // Bus functions
 //--------------------------------------------------------------------+
 
-static void __no_inline_not_in_flash_func(send_pre)(const pio_port_t *pp) {
+static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   // send PRE token in full-speed
+  pp->low_speed = false;
   uint16_t instr = pp->fs_tx_pre_program->instructions[0];
   pp->pio_usb_tx->instr_mem[pp->offset_tx] = instr;
 
   SM_SET_CLKDIV(pp->pio_usb_tx, pp->sm_tx, pp->clk_div_fs_tx);
 
   pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_start_instr);
+  pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK;       // clear complete flag
   dma_channel_transfer_from_buffer_now(pp->tx_ch, pre_encoded,
                                        sizeof(pre_encoded));
-  pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK;       // clear complete flag
 
   while ((pp->pio_usb_tx->irq & IRQ_TX_EOP_MASK) == 0) {
     continue;
   }
-  pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
+  // Wait for complete transmission of the PRE packet. We don't want to
+  // accidentally send trailing Ks in low speed mode due to an early start
+  // instruction that re-enables the outputs.
+  uint32_t stall_mask = 1 << (PIO_FDEBUG_TXSTALL_LSB + pp->sm_tx);
+  pp->pio_usb_tx->fdebug = stall_mask; // clear sticky stall mask bit
+  while (!(pp->pio_usb_tx->fdebug & stall_mask)) {
+    continue;
+  }
 
   // change bus speed to low-speed
+  pp->low_speed = true;
   pio_sm_set_enabled(pp->pio_usb_tx, pp->sm_tx, false);
   instr = pp->fs_tx_program->instructions[0];
   pp->pio_usb_tx->instr_mem[pp->offset_tx] = instr;
@@ -75,7 +82,7 @@ static void __no_inline_not_in_flash_func(send_pre)(const pio_port_t *pp) {
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_eop, true);
 }
 
-void __not_in_flash_func(pio_usb_bus_usb_transfer)(const pio_port_t *pp,
+void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
                                               uint8_t *data, uint16_t len) {
   if (pp->need_pre) {
     send_pre(pp);
@@ -89,31 +96,23 @@ void __not_in_flash_func(pio_usb_bus_usb_transfer)(const pio_port_t *pp,
   while ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) == 0) {
     continue;
   }
-  pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
-  while (*pc < PIO_USB_TX_ENCODED_DATA_COMP) {
-    continue;
+  pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
+
+  if (pp->low_speed) {
+    // For Low speed host, wait until EOP is fully sent. Otherwise, we can send another packet
+    // before inter-packet delay timeout, which is 2-bit time by USB specs.
+    // For Full speed, our overhead is probably enough without this additional wait.
+    while (*pc <= PIO_USB_TX_ENCODED_DATA_COMP) {
+      continue;
+    }
+  } else {
+    while (*pc < PIO_USB_TX_ENCODED_DATA_COMP) {
+      continue;
+    }
   }
 }
 
-void __no_inline_not_in_flash_func(pio_usb_bus_send_handshake)(
-    const pio_port_t *pp, uint8_t pid) {
-  switch (pid) {
-  case USB_PID_ACK:
-    pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
-    break;
-
-  case USB_PID_NAK:
-    pio_usb_bus_usb_transfer(pp, nak_encoded, 5);
-    break;
-
-  case USB_PID_STALL:
-  default:
-    pio_usb_bus_usb_transfer(pp, stall_encoded, 5);
-    break;
-  }
-}
-
-void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(const pio_port_t *pp,
+void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(pio_port_t *pp,
                                                            uint8_t token,
                                                            uint8_t addr,
                                                            uint8_t ep_num) {
@@ -139,31 +138,47 @@ void __no_inline_not_in_flash_func(pio_usb_bus_prepare_receive)(const pio_port_t
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, true);
 }
 
-void __no_inline_not_in_flash_func(pio_usb_bus_start_receive)(const pio_port_t *pp) {
-  pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
-}
+static inline __force_inline bool pio_usb_bus_wait_for_rx_start(const pio_port_t* pp) {
+  // USB 2.0 specs: 7.1.19.1: handshake timeout
+  // Full-Speed (12 Mbps): 1 bit time = 1 / 12 MHz = 83.3 ns --> 16 bit times = 1.33 µs
+  // Low-Speed (1.5 Mbps): 1 bit time = 1 / 1.5 MHz = 666.7 ns --> 16 bit times = 10.67 µs
+
+  // We're starting the timing somewhere in the current microsecond so always assume the first one
+  // is less than a full microsecond. For example, a wait of 2 could actually be 1.1 microseconds.
+  // We will use 3 us (24 bit time) for Full speed and 12us (18 bit time) for Low speed.
+  uint32_t start = get_time_us_32();
+  uint32_t timeout = pp->low_speed ? 12 : 3;
+  while (get_time_us_32() - start <= timeout) {
+    if ((pp->pio_usb_rx->irq & IRQ_RX_START_MASK) != 0) {
+      return true;
+    }
+  }
+  return false;
+};
 
 uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_handshake)(pio_port_t* pp) {
-  int16_t t = 240;
-  int16_t idx = 0;
+  if (!pio_usb_bus_wait_for_rx_start(pp)) {
+    return 0;
+  }
 
-  while (t--) {
-    if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
+  int16_t idx = 0;
+  // Timeout in seven microseconds. That is enough time to receive one byte at low speed.
+  // This is to detect packets without an EOP because the device was unplugged.
+  uint32_t start = get_time_us_32();
+  while (get_time_us_32() - start <= 7) {
+    if (idx < 2 && pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
       uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
       pp->usb_rx_buffer[idx++] = data;
-      if (idx == 2) {
-        break;
-      }
+
+      start = get_time_us_32(); // reset timeout when a byte is received
+    } else if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) != 0) {
+      break; // exit if we've gotten an EOP
     }
   }
 
-  if (t > 0) {
-    while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
-      continue;
-    }
+  if (idx != 2 || pp->usb_rx_buffer[0] != USB_SYNC) {
+    return 0; // invalid handshake
   }
-
- // pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, true);
 
   return pp->usb_rx_buffer[1];
 }
@@ -174,50 +189,70 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
   uint16_t crc_prev = 0xffff;
   uint16_t crc_prev2 = 0xffff;
   uint16_t crc_receive = 0xffff;
-  uint16_t crc_receive_inverse;
   bool crc_match = false;
-  int16_t t = 240;
-  uint16_t idx = 0;
+  const uint16_t rx_buf_len = sizeof(pp->usb_rx_buffer) / sizeof(pp->usb_rx_buffer[0]);
+  int16_t idx = 0;
 
-  while (t--) {
-    if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
-      uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
-      pp->usb_rx_buffer[idx++] = data;
-      if (idx == 2) {
-        break;
-      }
-    }
+  // Per USB Specs 7.1.18 for turnaround: We must wait at least 2 bit times for inter-packet delay.
+  // This is essential for working with LS device specially when we overlocked the mcu.
+  // Pre-calculate number of cycle per bit time
+  // - Lowspeed: 1 bit time = (cpufreq / 1.5 Mhz) = clk_div_ls_tx.div_int*6Mhz / 1.5 Mhz = 4 * clk_div_ls_tx.div_int
+  // - Fullspeed 1 bit time = (cpufreq / 12 Mhz) = clk_div_fs_tx.div_int*48Mhz / 12 Mhz = 4 * clk_div_fs_tx.div_int
+  // Since there is also overhead, we only wait 1.5 bit for LS and no wait for FS
+  uint32_t turnaround_in_cycle = 0;
+  if (pp->low_speed) {
+    turnaround_in_cycle = 6 * pp->clk_div_ls_tx.div_int; // 1.5 bit time
   }
 
-  // timing critical start
-  if (t > 0) {
-    if (handshake == USB_PID_ACK) {
-      while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
-        if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
-          uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
-          crc_prev2 = crc_prev;
-          crc_prev = crc;
-          crc = update_usb_crc16(crc, data);
-          pp->usb_rx_buffer[idx++] = data;
-          crc_receive = (crc_receive >> 8) | (data << 8);
-          crc_receive_inverse = crc_receive ^ 0xffff;
-          crc_match = (crc_receive_inverse == crc_prev2);
+  if (!pio_usb_bus_wait_for_rx_start(pp)) {
+    return -1;
+  }
+
+  // Timing Critical: use local variable to reduce de-reference
+  PIO pio_usb_rx = pp->pio_usb_rx;
+  uint sm_rx =  pp->sm_rx;
+  uint8_t *usb_rx_buffer = pp->usb_rx_buffer;
+
+  // Timeout in seven microseconds. That is enough time to receive one byte at low speed.
+  // This is to detect packets without an EOP because the device was unplugged.
+  uint32_t start = get_time_us_32();
+  while (1) {
+    if (pio_sm_get_rx_fifo_level(pio_usb_rx, sm_rx)) {
+      uint8_t data = pio_sm_get(pio_usb_rx, sm_rx) >> 24;
+      if (idx < rx_buf_len) {
+        usb_rx_buffer[idx] = data;
+      }
+      start = get_time_us_32(); // reset timeout when a byte is received
+
+      if (idx >= 2) {
+        crc_prev2 = crc_prev;
+        crc_prev = crc;
+        crc = update_usb_crc16(crc, data);
+        crc_receive = (crc_receive >> 8) | (data << 8);
+        crc_match = ((crc_receive ^ 0xffff) == crc_prev2);
+      }
+      idx++;
+    } else if ((pio_usb_rx->irq & IRQ_RX_COMP_MASK) != 0) {
+      // Exit since we've gotten an EOP.
+      // Timing critical: per USB specs, handshake must be sent within 2-7 bit-time strictly
+      if (turnaround_in_cycle) {
+        busy_wait_at_least_cycles(turnaround_in_cycle); // wait for turnaround for LS only
+      }
+
+      if (handshake == USB_PID_ACK) {
+        // Only ACK if crc matches
+        if (idx >= 4 && crc_match) {
+          pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
+          return idx - 4;
         }
+      } else if (handshake == USB_PID_NAK) {
+        pio_usb_bus_usb_transfer(pp, nak_encoded, 5);
+      } else {
+        pio_usb_bus_usb_transfer(pp, stall_encoded, 5);
       }
-
-      if (idx >= 4 && crc_match) {
-        pio_usb_bus_send_handshake(pp, USB_PID_ACK);
-        // timing critical end
-        return idx - 4;
-      }
-    } else {
-      // just discard received data since we NAK/STALL anyway
-      while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
-        continue;
-      }
-      pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
-
-      pio_usb_bus_send_handshake(pp, handshake);
+      break;
+    } else if (get_time_us_32() - start > 7) {
+      return -1; // device is probably unplugged
     }
   }
 
@@ -242,8 +277,15 @@ static void __no_inline_not_in_flash_func(initialize_host_programs)(
   pp->offset_tx = 0;
   usb_tx_fs_program_init(pp->pio_usb_tx, pp->sm_tx, pp->offset_tx, port->pin_dp,
                          port->pin_dm);
-  pp->tx_start_instr = pio_encode_jmp(pp->offset_tx + 4);
-  pp->tx_reset_instr = pio_encode_jmp(pp->offset_tx + 2);
+  uint32_t sideset_fj_lk;
+  if (c->pinout == PIO_USB_PINOUT_DPDM) {
+    sideset_fj_lk = pio_encode_sideset(2, usb_tx_dpdm_FJ_LK);
+  } else {
+    sideset_fj_lk = pio_encode_sideset(2, usb_tx_dmdp_FJ_LK);
+  }
+
+  pp->tx_start_instr = pio_encode_jmp(pp->offset_tx + 4) | sideset_fj_lk;
+  pp->tx_reset_instr = pio_encode_jmp(pp->offset_tx + 2) | sideset_fj_lk;
 
   add_pio_host_rx_program(pp->pio_usb_rx, &usb_nrzi_decoder_program,
                           &usb_nrzi_decoder_debug_program, &pp->offset_rx,
@@ -281,25 +323,38 @@ static void configure_tx_channel(uint8_t ch, PIO pio, uint sm) {
 
 static void apply_config(pio_port_t *pp, const pio_usb_configuration_t *c,
                          root_port_t *port) {
-  pp->pio_usb_tx = c->pio_tx_num == 0 ? pio0 : pio1;
+  pp->pio_usb_tx = pio_get_instance(c->pio_tx_num);
   pp->sm_tx = c->sm_tx;
   pp->tx_ch = c->tx_ch;
-  pp->pio_usb_rx = c->pio_rx_num == 0 ? pio0 : pio1;
+  pp->pio_usb_rx = pio_get_instance(c->pio_rx_num);
   pp->sm_rx = c->sm_rx;
   pp->sm_eop = c->sm_eop;
   port->pin_dp = c->pin_dp;
 
+  uint highest_pin;
   if (c->pinout == PIO_USB_PINOUT_DPDM) {
     port->pin_dm = c->pin_dp + 1;
+    highest_pin = port->pin_dm;
     pp->fs_tx_program = &usb_tx_dpdm_program;
     pp->fs_tx_pre_program = &usb_tx_pre_dpdm_program;
     pp->ls_tx_program = &usb_tx_dmdp_program;
   } else {
     port->pin_dm = c->pin_dp - 1;
+    highest_pin = port->pin_dp;
     pp->fs_tx_program = &usb_tx_dmdp_program;
     pp->fs_tx_pre_program = &usb_tx_pre_dmdp_program;
     pp->ls_tx_program = &usb_tx_dpdm_program;
   }
+
+#if defined(PICO_PIO_USE_GPIO_BASE) && PICO_PIO_USE_GPIO_BASE+0
+  if (highest_pin > 32) {
+    pio_set_gpio_base(pp->pio_usb_tx, 16);
+    pio_set_gpio_base(pp->pio_usb_rx, 16);
+  }
+#else
+  (void)highest_pin;
+#endif
+
   port->pinout = c->pinout;
 
   pp->debug_pin_rx = c->debug_pin_rx;
@@ -321,7 +376,7 @@ void pio_usb_bus_init(pio_port_t *pp, const pio_usb_configuration_t *c,
                       root_port_t *root) {
   memset(root, 0, sizeof(root_port_t));
 
-  pp->pio_usb_tx = c->pio_tx_num == 0 ? pio0 : pio1;
+  pp->pio_usb_tx = pio_get_instance(c->pio_tx_num);
   dma_claim_mask(1<<c->tx_ch);
   configure_tx_channel(c->tx_ch, pp->pio_usb_tx, c->sm_tx);
 
@@ -407,11 +462,11 @@ uint8_t __no_inline_not_in_flash_func(pio_usb_ll_encode_tx_data)(
   int current_state = 1;
   int bit_stuffing = 6;
   for (int idx = 0; idx < buffer_len; idx++) {
-    uint8_t byte = buffer[idx];
+    uint8_t data_byte = buffer[idx];
     for (int b = 0; b < 8; b++) {
       uint8_t byte_idx = bit_idx >> 2;
       encoded_data[byte_idx] <<= 2;
-      if (byte & (1 << b)) {
+      if (data_byte & (1 << b)) {
         if (current_state) {
           encoded_data[byte_idx] |= PIO_USB_TX_ENCODED_DATA_K;
         } else {
@@ -496,6 +551,7 @@ bool __no_inline_not_in_flash_func(pio_usb_ll_transfer_start)(endpoint_t *ep,
   ep->app_buf = buffer;
   ep->total_len = buflen;
   ep->actual_len = 0;
+  ep->failed_count = 0;
 
   if (ep->is_tx) {
     prepare_tx_data(ep);
@@ -571,8 +627,8 @@ int pio_usb_host_add_port(uint8_t pin_dp, PIO_USB_PINOUT pinout) {
       pio_gpio_init(pio_port[0].pio_usb_tx, root->pin_dm);
       gpio_set_inover(pin_dp, GPIO_OVERRIDE_INVERT);
       gpio_set_inover(root->pin_dm, GPIO_OVERRIDE_INVERT);
-      pio_sm_set_pindirs_with_mask(pio_port[0].pio_usb_tx, pio_port[0].sm_tx, 0,
-                                   (1 << pin_dp) | (1 << root->pin_dm));
+      pio_sm_set_pindirs_with_mask64(pio_port[0].pio_usb_tx, pio_port[0].sm_tx, 0,
+                                   (1ull << pin_dp) | (1ull << root->pin_dm));
       port_pin_drive_setting(root);
       root->initialized = true;
 

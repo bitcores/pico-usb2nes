@@ -5,8 +5,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
-#pragma GCC push_options
-#pragma GCC optimize("-O3")
+
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -56,7 +55,7 @@
 #define BACKUP_LED 14
 
 
-#define MAX_BUFFER 16
+#define MAX_BUFFER 256  // lets use a circular buffer with 1 ubyte pointer
 #define WORD_SIZE 4
 
 // extra config for devices in direct input mode
@@ -64,7 +63,6 @@
 #define HORILHAND 1
 #define HORILOWSPD 0
 #define SENDREPEATS 1
-
 
 // configuration for PIO USB
 // DPDM configuration D+ = pin 6, D- = pin 7
@@ -80,6 +78,14 @@
             PIO_USB_DEBUG_PIN_NONE, false, PIO_USB_PINOUT_DPDM                  \
     }
 
+#define MAX_REPORT 4
+// Each HID instance can has multiple reports
+static struct
+{
+  uint8_t report_count;
+  tuh_hid_report_info_t report_info[MAX_REPORT];
+}hid_info[CFG_TUH_HID];
+
 static const uint8_t modkeys[] = { 
     KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_LEFTMETA,
     KEY_RIGHTCTRL, KEY_RIGHTSHIFT, KEY_RIGHTALT, KEY_RIGHTMETA
@@ -89,37 +95,47 @@ static const uint8_t modkeys[] = {
 static struct
 {
     uint8_t mem[6];
+    uint8_t mem_p;
     uint8_t mem_address;
     bool mem_address_written;
     bool garbage_message;
+    bool skiplen;
 } hostmsg;
 
 static bool new_input_msg;
 // FIFO buffer for keypresses for standard mode
-// buffer length will be relatively small because under standard operation
-// the NES is likely to be reading from the buffer very frequently
-static uint8_t bufferindex = 0;
+static uint8_t keybuffer_i = 0;
 static uint8_t keybuffer[MAX_BUFFER];
-static uint8_t kbbbindex = 0;
-static uint8_t kbbackbuffer[MAX_BUFFER];
-// transport buffer index
-static uint8_t transbbindex = 0;
+static uint8_t keybuffer_r = 0;
 // mouse updates won't be buffered like the keyboard, if multiple updates come
 // inbetween a frame, we want to put them together instead of stack them up
 // oversizing the buffer type to mitigate overflow
 static int16_t msebuffer[4];
 // we want to store 
 static int16_t mseinstbuf[4];
+static volatile uint8_t joypadinst = 0;
+// FIFO buffer for inputs in tasreplay mode
+static uint8_t inpbuff_i = 0; // buffer input index
+static uint8_t inpbuff[MAX_BUFFER];
+static uint8_t inpbuff_r = 0; // buffer read index
 
 static bool NESinlatch = false;
 
 static uint8_t usb2kbmode;
-static bool i2chostmode = false;
+static bool i2chostenable = false;
+static uint8_t i2cmode = 0;
 
 static bool instrobe = false;
 
 static uint32_t kbword = 0;
 static uint32_t mseword = 0;
+static uint8_t nesjoypad = 0;
+
+// gonna use arrow keys for dpad
+// x for A, z for B, q for select, w for start
+// if you are changing these keys, the order is important!
+static const uint8_t neskeys[] = { KEY_X, KEY_Z, KEY_Q, KEY_W, 
+                        KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT };
 
 
 // https://github.com/raspberrypi/pico-examples/blob/master/blink/blink.c
@@ -155,8 +171,12 @@ void pico_set_led(bool led_on) {
     // Ask the wifi "driver" to set the GPIO on or off
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
 #elif defined(PICO_DEFAULT_WS2812_PIN)
-    // for RP2040-zerp devices
-    pio_sm_put_blocking(pio0, 1, 0x22222222); // dullwhite
+    // for RP2040-zero devices
+    if (led_on) {
+        pio_sm_put_blocking(pio0, 1, 0x22222222); // dullwhite
+    } else {
+        pio_sm_put_blocking(pio0, 1, 0); // off
+    }
 #endif
 }
 // -----------------------------------------------------------
@@ -164,17 +184,8 @@ void pico_set_led(bool led_on) {
 // handle key input into the buffer or matrices
 static void keycode_handler(uint8_t ascii) {
     // keyboard mouse host mode
-    if ((bufferindex+1) == MAX_BUFFER) {
-        for (int i = 1; i < MAX_BUFFER; i++) {
-            keybuffer[i-1] = keybuffer[i];
-        }
-        keybuffer[bufferindex] = ascii;
-    }
-    else {
-        keybuffer[bufferindex] = ascii;
-        bufferindex++;
-    }
-    
+    keybuffer_i = (keybuffer_i + 1) % 256;
+    keybuffer[keybuffer_i] = ascii;    
 }
 
 // I2C configuration
@@ -182,62 +193,80 @@ static const uint I2C_ADDRESS = 0x17;
 static const uint I2C_BAUDRATE = 100000; // 100 kHz
 // Our handler is called from the I2C ISR, so it must complete quickly. Blocking calls /
 // printing to stdio may interfere with interrupt handling.
+// =================
+// the i2c host can send a variety of messages to different addresses
+// this includes setting the mode of this device, requesting buffer state and
+// delivering inputs for the buffer
+// 0x00 - deliver inputs, 0x01 - buffer state, 0x10 - set mode
 static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
     switch (event) {
     case I2C_SLAVE_RECEIVE: // master has written some data
         if (!hostmsg.mem_address_written) {
             // writes always start with the memory address
-            // the first value here is a len, ignore
             hostmsg.mem_address = i2c_read_byte_raw(i2c);
-            // host should always address addr 0 in the buffer
-            if (hostmsg.mem_address != 0){
-                hostmsg.garbage_message = true;
-            } else {
-                hostmsg.garbage_message = false;
-            }
+            // the first value here is a len, ignore
+            // address should be 0x00 for inputs, 0x10 for set mode
+            hostmsg.garbage_message = !(hostmsg.mem_address == 0x00 || hostmsg.mem_address == 0x10);
+            hostmsg.skiplen = (hostmsg.mem_address == 0x00);
             hostmsg.mem_address_written = true;
+            hostmsg.mem_p = 0;
         } else {
             // if it is garbage we just read the values
             // but don't put them in memory
-            if (hostmsg.garbage_message) {
+            // also the message len byte is skipped
+            if (hostmsg.garbage_message || hostmsg.skiplen) {
                 i2c_read_byte_raw(i2c);
+                hostmsg.skiplen = false;
             }
-            else { // put thew values into buffer
-                hostmsg.mem[hostmsg.mem_address] = i2c_read_byte_raw(i2c);
-                hostmsg.mem_address = (hostmsg.mem_address + 1) % 6;
+            else { 
+                // put the values into buffer
+                if (hostmsg.mem_address == 0x00) {
+                    if (i2cmode == 0x00) {
+                        hostmsg.mem[hostmsg.mem_p] = i2c_read_byte_raw(i2c);
+                        hostmsg.mem_p = (hostmsg.mem_p + 1) % 6;
+                    } else if (i2cmode == 0x10) {
+                        inpbuff_i = (inpbuff_i + 1) % 256;
+                        inpbuff[inpbuff_i] = i2c_read_byte_raw(i2c);
+                    }
+                } else if (hostmsg.mem_address == 0x10) {
+                    // this should be a single byte
+                    i2cmode = i2c_read_byte_raw(i2c);
+                } 
             }
         }
         break;
     case I2C_SLAVE_REQUEST: // master is requesting data
-        // load from memory
-        i2c_write_byte_raw(i2c, hostmsg.mem[hostmsg.mem_address]);
-        hostmsg.mem_address = (hostmsg.mem_address + 1) % 6;
+        i2c_write_byte_raw(i2c, i2cmode);
+        uint8_t buffree = (inpbuff_r - inpbuff_i -1);
+        i2c_write_byte_raw(i2c, buffree);
         break;
     case I2C_SLAVE_FINISH: // master has signalled Stop / Restart
         if (!hostmsg.garbage_message) {
-            // parse the value from mem[1] if not 0x00
-            if (hostmsg.mem[1] != 0x00) {
-                keycode_handler(hostmsg.mem[1]);
-            }
-            // only update mouse buffer if mouse is "present"
-            if ((hostmsg.mem[2] & 32) == 32) {
-                // and the first byte with the current value
-                // this means if a button is pressed, it will stay "pressed"
-                // until the NES polls it (probably next frame)
-                msebuffer[0] |= hostmsg.mem[2];
-                // if true, we are in relative mode
-                if ((msebuffer[0] & 8) == 8 && new_input_msg) {
-                    msebuffer[1] += (int8_t)hostmsg.mem[3];
-                    msebuffer[2] += (int8_t)hostmsg.mem[4];
-                } else {
-                    msebuffer[1] = (int8_t)hostmsg.mem[3];
-                    msebuffer[2] = (int8_t)hostmsg.mem[4];   
+            if (i2cmode == 0x00) {
+                // parse the value from mem[1] if not 0x00
+                if (hostmsg.mem[0] != 0x00) {
+                    keycode_handler(hostmsg.mem[0]);
                 }
-                // some wheel movements or middle button events could
-                // be missed. target for improvement later
-                msebuffer[3] |= hostmsg.mem[5];
+                // only update mouse buffer if mouse is "present"
+                if ((hostmsg.mem[1] & 32) == 32) {
+                    // and the first byte with the current value
+                    // this means if a button is pressed, it will stay "pressed"
+                    // until the NES polls it (probably next frame)
+                    msebuffer[0] |= hostmsg.mem[1];
+                    // if true, we are in relative mode
+                    if ((msebuffer[0] & 8) == 8 && new_input_msg) {
+                        msebuffer[1] += (int8_t)hostmsg.mem[2];
+                        msebuffer[2] += (int8_t)hostmsg.mem[3];
+                    } else {
+                        msebuffer[1] = (int8_t)hostmsg.mem[2];
+                        msebuffer[2] = (int8_t)hostmsg.mem[3];   
+                    }
+                    // some wheel movements or middle button events could
+                    // be missed. target for improvement later
+                    msebuffer[3] |= hostmsg.mem[4];
+                }
+                new_input_msg = true;
             }
-            new_input_msg = true;
         }
         
         hostmsg.mem_address_written = false;
@@ -252,10 +281,10 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
 static void update_mouse_data() {
     // if there is new data from the host
     if (new_input_msg) {
-        if (i2chostmode) {
+        if (i2chostenable) {
             // actually update button values
-            msebuffer[0] = hostmsg.mem[2];
-            msebuffer[3] = hostmsg.mem[5];
+            msebuffer[0] = hostmsg.mem[1];
+            msebuffer[3] = hostmsg.mem[4];
         } else {
             msebuffer[0] = mseinstbuf[0];
             msebuffer[1] = mseinstbuf[1];
@@ -272,6 +301,7 @@ void pio_IRQ_handler() {
     if (pio_interrupt_get(pio0, 3)) {
         mseword = mseword << 1;
         kbword = kbword << 1;
+        nesjoypad = nesjoypad >> 1;
 
         pio_interrupt_clear(pio0, 3);
     }
@@ -286,7 +316,7 @@ void nes_handler_thread() {
 
     usb2famikb_init(NES_OUT, NES_JOY1OE, NES_JOY2OE, NES_DATA, usb2kbmode);
 
-    for (;;) {
+    while (true) {
 
         uint8_t nesread = (pio0->intr >> 8) & 0x0F;
         
@@ -305,36 +335,45 @@ void nes_handler_thread() {
 
             kbword = 0x00000000;
             mseword = 0x00000000;
-            // load the four oldest buffered values
-            for (int i = 0; i < WORD_SIZE; i++) {
-                kbword = kbword << 8;
-                kbword += keybuffer[i];
-                // mouse doesn't actually have a history
-                // just get the latest values
-                mseword = mseword << 8;
-                mseword += (uint8_t) msebuffer[i];
-            }
-            int c = WORD_SIZE;
-            if (bufferindex < WORD_SIZE) {
-                c = bufferindex;
-            }
-            for (int i = c; i < MAX_BUFFER; i++) {
-                keybuffer[i-c] = keybuffer[i];
-            }
-            bufferindex = bufferindex - c;
+            if (i2chostenable && i2cmode == 0x10) {
+                // if the read pointer has not caught up to the input pointer
+                // increment it. this should only happen when the tas replay
+                // ends, or if you start the game before starting the replay
+                if (inpbuff_r != inpbuff_i) {
+                    inpbuff_r = (inpbuff_r + 1) % 256;
+                }
+                nesjoypad = inpbuff[inpbuff_r];
+            } else {
+                nesjoypad = joypadinst;
+                // load the four oldest buffered values
+                for (int i = 0; i < WORD_SIZE; i++) {
+                    kbword = kbword << 8;
+                    if (keybuffer_r != keybuffer_i) {
+                        keybuffer_r = (keybuffer_r + 1) % 256;
+                        kbword += keybuffer[keybuffer_r];
+                    }
+                    // mouse doesn't actually have a history
+                    // just get the latest values
+                    mseword = mseword << 8;
+                    mseword += (uint8_t) msebuffer[i];
+                }
 
-            update_mouse_data();
+                update_mouse_data();
+            }
 
             NESinlatch = false;
         }
 
-        uint32_t serialout = 3;
+        uint32_t serialout = 0; // effectively D1 on the pico, doesn't go to nes
         // push next mouse bit in
-        serialout += (~mseword & 0x80000000) >> 27;
+        serialout |= (mseword & 0x80000000) >> 27;
         // push the next keyboard bit in
-        serialout += (~kbword & 0x80000000) >> 28;
-    
-        usb2famikb_putkb(serialout);
+        serialout |= (kbword & 0x80000000) >> 28;
+        // push the joypad bit, this could be connected to D0 or D1 on the port
+        serialout |= (nesjoypad & 0x01);
+
+        usb2famikb_putkb(~serialout);
+ 
     }
 
 }
@@ -359,7 +398,7 @@ int main() {
     gpio_set_dir(i2cHOST_ENABLE, GPIO_IN);
     gpio_pull_down(i2cHOST_ENABLE);
     
-    i2chostmode = gpio_get(i2cHOST_ENABLE);
+    i2chostenable = gpio_get(i2cHOST_ENABLE);
 
     // prepare buffers
     for (int i = 0; i < MAX_BUFFER; i++) {
@@ -373,16 +412,15 @@ int main() {
     // strobes for update before data received it will know
     // the interface is present
     msebuffer[0] = mseinstbuf[0] = 0x06;
+    joypadinst = 0x00;
 
     multicore_reset_core1();
     //  run the NES handler on seperate core
     multicore_launch_core1(nes_handler_thread);
 
-    // turn on LED to show device has booted fine
+    // init the LED
     pico_led_init();
-    pico_set_led(true);
-
-    if (i2chostmode) {
+    if (i2chostenable) {
         gpio_init(I2C_SDA_PIN);
         gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
         gpio_pull_up(I2C_SDA_PIN);
@@ -391,24 +429,15 @@ int main() {
         gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
         gpio_pull_up(I2C_SCL_PIN);
 
-        
         i2c_init(i2c0, I2C_BAUDRATE);
         // configure I2C0 for slave mode
         i2c_slave_init(i2c0, I2C_ADDRESS, &i2c_slave_handler);
 
+        // everything configured, turn on the LED
+        pico_set_led(true);
         // loop forever now
-        for (;;) {
-            if ((transbbindex != kbbbindex) && !NESinlatch){
-                // if the buffer is full, don't do anything yet
-                if ((bufferindex+1) < MAX_BUFFER) {
-                    keybuffer[bufferindex] = kbbackbuffer[transbbindex];
-                    bufferindex++;
-
-                    transbbindex = (transbbindex + 1) % MAX_BUFFER;
-                } 
-            }
-            // gets a little ansy without a little sleep here
-            sleep_ms(1);
+        while (true) {
+            tight_loop_contents();
         }
         
     }
@@ -424,6 +453,8 @@ int main() {
         // To run USB SOF interrupt in core0, init host stack for pio_usb (roothub
         // port1) on core0
         tuh_init(1);
+        // everything configured, turn on the LED
+        pico_set_led(true);
 
         while (true) {
             tuh_task(); // tinyusb host task
@@ -461,11 +492,12 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
                 break;
         }
         new_input_msg = true;
-
-        //  set up report receiving
-        tuh_hid_receive_report(dev_addr, instance);
-
+    } else {
+        // for when device is not a boot type (gamepads for example)
+        hid_info[instance].report_count = tuh_hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
     }
+    //  set up report receiving
+    tuh_hid_receive_report(dev_addr, instance);
 }
 
 // Invoked when device with hid interface is un-mounted
@@ -479,6 +511,8 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
             break;
         case (HID_ITF_PROTOCOL_MOUSE):
             mseinstbuf[0] &= 0xDF;
+            break;
+        default:
             break;
     }
     new_input_msg = true;
@@ -528,7 +562,7 @@ static inline void update_modifiers(hid_keyboard_report_t const *prev_report, hi
 static void process_kbd_report(hid_keyboard_report_t const *report)
 {
     static hid_keyboard_report_t prev_report = { 0, 0, {0} }; // previous report to check key released
-
+    uint8_t newjoypad = 0x00;
     // keycode positions change when released, so need to check all
     find_releases_in_report(&prev_report, report);
     // check if modifier keys have changed
@@ -544,9 +578,15 @@ static void process_kbd_report(hid_keyboard_report_t const *report)
             } else {
                 keycode_handler(keycode);
             }
+            for (uint8_t j = 0; j < 8; j++) {
+                if (keycode == neskeys[j]) {
+                    newjoypad |= (1 << j);
+                    break;
+                }
+            }
         }
     }
-
+    joypadinst = newjoypad;
     prev_report = *report;
 }
 
@@ -594,28 +634,128 @@ static void process_mouse_report(hid_mouse_report_t const *report)
 
 }
 
+// process the gamepad report
+// gamepads are complicated, what is done here will depend on how long
+// the report is. for now, 3 byte report: dpad x, dpad y, buttons
+static void process_gamepad_report(uint8_t const* report, uint16_t len)
+{
+    uint8_t newjoypad = 0x00;
+    if (len == 3) {
+        // left overrides up
+        if (report[0] == 0x00) {
+            newjoypad |= 64;
+        }
+        else if (report[0] == 0xFF) {
+            newjoypad |= 128;
+        }
+        // up overrides down
+        if (report[1] == 0x00) {
+            newjoypad |= 16;
+        }
+        else if (report[1] == 0xFF) {
+            newjoypad |= 32;
+        }
+        // other buttons 
+        if ((report[2] & 0x80) == 0x80) {
+            newjoypad |= 8;
+        }
+        if ((report[2] & 0x40) == 0x40) {
+            newjoypad |= 4;
+        }
+        if ((report[2] & 0x04) == 0x04) {
+            newjoypad |= 2;
+        }
+        if ((report[2] & 0x08) == 0x08) {
+            newjoypad |= 1;
+        }
+
+        joypadinst = newjoypad;
+    }
+    
+}
+
+//--------------------------------------------------------------------+
+// Generic Report
+//--------------------------------------------------------------------+
+// handle non-boot reports, especially for gamepads
+static void process_generic_report(uint8_t instance, uint8_t const* report, uint16_t len)
+{
+    (void) len;
+
+    uint8_t const rpt_count = hid_info[instance].report_count;
+    tuh_hid_report_info_t* rpt_info_arr = hid_info[instance].report_info;
+    tuh_hid_report_info_t* rpt_info = NULL;
+
+    if ( rpt_count == 1 && rpt_info_arr[0].report_id == 0) {
+        // Simple report without report ID as 1st byte
+        rpt_info = &rpt_info_arr[0];
+    }
+    else {
+        // Composite report, 1st byte is report ID, data starts from 2nd byte
+        uint8_t const rpt_id = report[0];
+        // Find report id in the array
+        for(uint8_t i=0; i<rpt_count; i++) {
+            if (rpt_id == rpt_info_arr[i].report_id ) {
+                rpt_info = &rpt_info_arr[i];
+                break;
+            }
+        }
+        report++;
+        len--;
+    }
+
+    if (!rpt_info){
+        return;
+    }
+
+
+    if ( rpt_info->usage_page == HID_USAGE_PAGE_DESKTOP )
+    {
+        switch (rpt_info->usage)
+        {
+            case HID_USAGE_DESKTOP_KEYBOARD:
+            // Assume keyboard follow boot report layout
+            process_kbd_report((hid_keyboard_report_t const*) report );
+            break;
+
+            case HID_USAGE_DESKTOP_MOUSE:
+            // Assume mouse follow boot report layout
+            process_mouse_report((hid_mouse_report_t const*) report );
+            break;
+
+            case HID_USAGE_DESKTOP_GAMEPAD:
+            process_gamepad_report(report, len);
+            break;
+
+            default: break;
+        }
+    }
+}
+
 // Invoked when received report from device via interrupt endpoint
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report, uint16_t len)
 {
     (void) len;
-    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+    if (len > 0) {
+        uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
 
-    switch(itf_protocol)
-    {
-        case HID_ITF_PROTOCOL_KEYBOARD:
-        process_kbd_report((hid_keyboard_report_t const*) report );
-        break;
+        switch(itf_protocol)
+        {
+            case HID_ITF_PROTOCOL_KEYBOARD:
+            process_kbd_report((hid_keyboard_report_t const*) report );
+            break;
 
-        case HID_ITF_PROTOCOL_MOUSE:
-        process_mouse_report((hid_mouse_report_t const*) report );
-        break;
+            case HID_ITF_PROTOCOL_MOUSE:
+            process_mouse_report((hid_mouse_report_t const*) report );
+            break;
 
-        default: break;
+            default: 
+            // gamepads in particular require different identification
+            process_generic_report(instance, report, len);
+            break;
+        }
     }
-
     // continue to request to receive report
     tuh_hid_receive_report(dev_addr, instance);
 }
 
-
-#pragma GCC pop_options
