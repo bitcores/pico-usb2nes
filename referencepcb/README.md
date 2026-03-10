@@ -17,5 +17,7 @@ For the reference design you will need:
 
 [This Youtube video](https://www.youtube.com/watch?v=ve_WcSxNZzQ) goes over the components and assembly.
 
-These NES controller ports can be kinda hard to find, I will include a link to one source below but it may become unavailable
+These NES controller ports can be kinda hard to find, I will include a link to one source below (now unlisted, I am looking for other sources)
+
 [https://aliexpress.com/item/1005009418780409.html](https://aliexpress.com/item/1005009418780409.html)
+
